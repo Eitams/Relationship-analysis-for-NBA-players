@@ -1,0 +1,994 @@
+---
+title: "Performance vs. salary - a relationship analysis for NBA players"
+author: "Vladimira Gabor, Hartmann Urs, Eitam Shafran"
+date: "07/01/2022"
+output:
+  pdf_document:
+    fig_caption: true
+    number_sections: yes
+  html_document:
+    df_print: paged
+geometry: left = 2.5cm, right = 2cm, top = 2cm, bottom = 2cm
+fontsize: 10pt
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+\center Applied Machine Learning and Predictive Modeling 1\center
+\center Lecturers: Dr. Matteo Tanadini, Daniel Meister\center
+
+![](128270.jpg "Title")
+\pagebreak
+\tableofcontents
+
+\pagebreak
+
+# Introduction
+In this work, a relationship analysis of NBA players’ performance during the 2019-20 season was conducted. While the relationship between player's performance to their salaries during the following season was explored in chapter 3 and 4, a predictive model for the number of successful field goals per season is presented in chapter 5. Chapter 6 of this paper will describe a fictitious marketing optimization problem. 
+
+
+## Dataset
+Statistic data of NBA players’ performance during the 2019-20 season was downloaded from
+“basketball-reference.com” . The data consists of general information about the players, such as their age,
+team, position and number of games played. In addition, information about their performance during the
+season, such as the overall shooting tries and success, number of steals, blocks and more is available.
+Supplementary data on the player salaries during the season of 2020-21, was scraped from “hoopshype.com”
+and merged with the statistic data, using python. The merged data contain 33 attributes for 651 NBA players.
+
+
+## Dataset glossary
+
+![](glossary.jpg)
+\newpage
+
+# Data preprocessing and exploratory data analysis
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+# Importing libraries
+library(plyr)
+library(tidyverse)
+library(knitr)
+library(e1071)    ## skewness, SVM model
+library(multcomp) ## glht test
+library(caret) ## "tune" - selecting hyper parameter of SVM (cost), RMSE
+library(corrgram)
+library(InformationValue) ## optimal Cutoff
+library(neuralnet)
+library(lpSolve) ## optimization 
+
+set.seed(10)
+```
+
+
+```{r include=FALSE}
+# Importing data and creating a data frame
+df <- read.csv("NBA_all_players.csv", stringsAsFactors=TRUE)
+```
+
+
+
+```{r include=FALSE}
+df %>% dim()
+```
+
+**Getting an overview of data frame**
+```{r}
+df %>% dplyr::select(1:14) %>% head() %>% kable()
+df %>% dplyr::select(1,2,15:24) %>% head() %>% kable()
+df %>% dplyr::select(1,2,25:33) %>% head() %>% kable()
+```
+
+## Removing bias and redundant data 
+During the pre-processing stage, the following features were removed: 
+
+* all columns representing proportionate % values, those were considered as redundant data entries
+* players' names
+* column "Rk" Ranking
+
+The data frame is left with 24 columns.
+
+```{r}
+df <- df[,c('Age', 'AST', 'BLK', 'DRB', 'FG', 'FGA', 'FT', 'FTA', 'MP', 'ORB',
+            'PF', 'PTS', 'STL', 'TOV', 'TRB', 'X2P', 'X2PA', 'X3P', 'X3PA',
+            'Tm', 'Pos', 'G', 'GS','X2020.21')]
+```
+
+## Consolidating players' position column
+Positions in Basketball vary. Mix positions with insufficient amount of data (based on previews analysis) are aggregated to Center C, Small Forward SF, Shooting Guard SG and Point Guard PG.
+```{r}
+df <- df %>%
+   dplyr::mutate(Pos= car::recode(Pos,"c('C', 'C-PF') = 'C'; c('SF', 'SF-C',
+   'SF-PF', 'SF-SG')= 'SF';
+   c('SG', 'SG-PG') = 'SG'; c('PG', 'PG-SG') = 'PG'" ))
+```
+
+## Missing values
+To detect and expose missing values, the following function was created. 
+```{r}
+## Function, returning a table with the name of columns as rows,
+##  number of missing values and their percentage as columns
+missing.values <- function(df) {
+  missing.values <- df %>%
+    gather(key = "key", value = "val") %>%
+    mutate(is.missing = is.na(val)) %>%
+    group_by(key, is.missing) %>%
+    summarise(num.missing = n()) %>%
+    filter(is.missing==T) %>%
+    dplyr::select(-is.missing) %>%
+    arrange(desc(num.missing)) %>% 
+    mutate(percentage = round(num.missing/nrow(df)*100, 3))
+  return(missing.values)
+}
+```
+
+
+```{r, echo=FALSE}
+df_NA <- missing.values(df)
+df_NA %>% kable() ## presenting missing values in table format
+```
+**Key insight:** There are 99 rows with missing salary entries. We will split them from the original data:
+
+```{r, inlcude= FALSE}
+Missing_salary <- df[is.na(df$X2020.21),] ## data we can later make a prediction on
+df <- df[!is.na(df$X2020.21),] ## df without missing data
+```
+
+## Splitting the data for training and testing
+```{r}
+training_size <- 0.8
+training_rows <- sample(seq_len(nrow(df)),
+                        size = floor(training_size * nrow(df)))
+train <- df[training_rows, ]
+test <- df[-training_rows, ]
+```
+
+# Players' performance vs. Salary
+In this chapter, we will focus on features representing the player's performance during the season, in addition to his team, position and age data. To make sure our model represents the actual players’ performance, we will normalize the performance data by the time each player played during the season.
+
+  
+**Dependent variable DV = 'X2020.21'**
+
+![](feature_columns_chapter3.jpg)
+
+**Normalizing players' performance by time played**
+
+Normalized players' performance by time played and reunite with countable data (for train and test data).
+```{r}
+train_norm <- train[,c( 'AST', 'BLK', 'DRB', 'FG', 'FGA', 'FT', 'FTA', 'ORB',
+                        'PF', 'PTS', 'STL', 'TOV', 'TRB', 'X2P', 'X2PA', 'X3P',
+                        'X3PA')]/train[,'MP']   
+train_norm <- cbind(train_norm, train[,c('Age','Tm', 'Pos','X2020.21' )])
+```
+
+```{r, include=FALSE}
+test_norm <- test[,c( 'AST', 'BLK', 'DRB', 'FG', 'FGA', 'FT', 'FTA', 'ORB',
+                      'PF', 'PTS', 'STL', 'TOV', 'TRB', 'X2P', 'X2PA', 'X3P',
+                      'X3PA')]/test[,'MP'] ## MP = minutes played
+test_norm <- cbind(test_norm, test[,c('Age','Tm', 'Pos','X2020.21' )])
+```
+
+## Exploratory data analysis
+
+**Columns statistical characteristics**
+```{r, include=FALSE}
+train_norm %>% str()
+```
+```{r, echo=FALSE}
+train_norm %>% summary()
+```
+
+### Exploring Numerical features
+**Extracting names of numerical columns**
+```{r}
+names_numerical  <- train_norm %>% dplyr::select(where(is.integer)|where(is.numeric)) %>% 
+  colnames()
+```
+
+**Density plots**  
+Numerical variables are plotted as density plots to explore data distribution.
+```{r, warning = FALSE, fig.width=15, fig.height=10, fig.cap=" Density plots of numerical values"}
+train_norm[names_numerical] %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+  facet_wrap(~key, scales ='free') +
+  geom_density(color = 'black', fill = 'lightblue')+
+  ggtitle("Numerical variables")
+```
+Fig. 1: Density plots of numerical values
+
+
+
+**Data skewness** 
+```{r}
+sk <-sapply(train_norm[names_numerical], function(x) skewness(x, na.rm = TRUE)) %>% sort()  
+sk[1:10] %>% t() %>% kable(row.names = FALSE)
+sk[11:19] %>% t() %>% kable(row.names = FALSE)
+```
+**Key insights:**
+1) Salary column is an amount, based on figure 1 we can also see that it's right-skewed. Therefore, we should log-transform it before building the model.        
+2) All features are right skewed except for the X3PA feature.
+
+**Looking for outliers**   
+To analyze numerical values further and spot potential outliers, we plot our data in box plots.
+```{r, fig.width=12, fig.height=8}
+train_norm[names_numerical] %>% gather() %>% ggplot( aes(x = key, y=value)) +
+  facet_wrap(facets = 'key', scale = 'free') + geom_boxplot(na.rm = TRUE)
+```
+Fig. 2: Box plots of numerical data (before log-transformation)
+
+**Heatmap correlation matrix**  
+To make possible correlations visible, numerical values are plotted in a heatmap. Dark blue color represents strong positive correlation, while dark red describes strong negative correlation among features.
+```{r fig.height=5, fig.width=7, fig.align="center", echo=FALSE}
+cgram <- corrgram(train_norm[names_numerical], lower.panel=panel.shade,
+                  upper.panel=panel.ellipse)
+```
+Fig. 3: Heat map of numerical data
+
+
+**Key insights:**  1) Some of the features are highly correlated to each other (e.g. FG-PTS, DRB-TRB). These correlations need to test for multi-co-linearity.  
+2) To prevent misleading results, highly correlated variables are better not used together in interpretive models.  
+
+**Linear correlation with dependent variable**
+```{r}
+cgram["X2020.21",11:19] %>% sort() %>% t() %>% round(3) %>% kable() 
+
+cgram["X2020.21",1:10] %>% sort() %>% t() %>% round(3) %>% kable()
+```
+**Key insight:** With 47.25% variable PTS shows highest correlation to dependent variable X2020.21.
+
+### Categorical data: Position
+
+How differ salaries of players in different positions from each other? This can be displayed by box-plotting position vs. salary.
+```{r, fig.width=15, fig.height=5}
+train_norm %>% ggplot( aes(x = Pos, y=log(X2020.21))) + geom_boxplot(na.rm = TRUE)
+```
+Fig. 4: Boxplots salary (log-transformed) vs. position
+
+**Key insight:**
+It seems like players in PF-SF position - on average - earn less than players in other positions. Let's see if adding player position will improve the linear model on the overall.
+
+**Creating a base model without effect on other features**
+```{r}
+lm_0 <- lm(log(X2020.21) ~ 1, data = train_norm)  ## Linear model with 1 feature position
+lm_pos <- lm(log(X2020.21) ~ Pos, data = train_norm) ## Comparing model with position to base model
+anova(lm_0, lm_pos)
+```
+**Key insights:** 1) Adding players' position to the model does not have a statistically significant impact on the model performance.  
+2) Players in position PF-SF - on average - earn less than players in other positions.
+
+\newpage
+
+### Categorical data: Team
+
+How differ salaries of different teams from each other? This can be displayed by box-plotting team vs. salary.
+```{r, fig.width=15, fig.height=5}
+## Boxplot team vs salary
+train_norm %>% ggplot( aes(x = Tm, y=log(X2020.21))) + geom_boxplot(na.rm = TRUE)
+```
+Fig.5: Boxplots of salary (log-transformed) vs. team
+
+**Linear model with 1 feature team**
+```{r}
+lm_team <- lm(log(X2020.21) ~ Tm, data = train_norm)
+anova(lm_0, lm_team)  ## Comparing model with team to base model
+```
+**Key insights:**
+1) Adding players' team to the model doesn't have a statistically significant impact on the model performance.      
+2) From Fig 5 we can see a significant change of variance in the players' salaries between the teams.   
+(E.g. the variance in salaries among players in NYK is smaller then the variance of salaries among players in PHO)
+
+### Scatter plots
+Highest linear correlated features on dependent variable X2020.21 by order (before log-transformation):    
+
+![](numerical_data_3.8.jpg)
+
+Scatter plots will be created of all the numerical variables with the log(salaries) as dependent variable.
+
+```{r echo=FALSE, fig.height=15, fig.width=15, message=FALSE, warning=FALSE}
+require(gridExtra)
+
+## Scatter plots of highest correlated  parameters with dv
+
+## Salary vs points
+ax1 <- train_norm %>% ggplot( aes(x = PTS, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Turn overs
+ax2 <- train_norm %>% ggplot( aes(x = FT, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax3 <- train_norm %>% ggplot( aes(x = FG, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax4 <- train_norm %>% ggplot( aes(x = FTA, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax5 <- train_norm %>% ggplot( aes(x = FGA, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax6 <- train_norm %>% ggplot( aes(x = Age, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Points
+ax7 <- train_norm %>% ggplot( aes(x = TOV, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Assists
+ax8 <- train_norm %>% ggplot( aes(x = AST, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax9 <- train_norm %>% ggplot( aes(x = X2PA, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax10 <- train_norm %>% ggplot( aes(x = X2P, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax11 <- train_norm %>% ggplot( aes(x = X3P, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax12 <- train_norm %>% ggplot( aes(x = DRB, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Scatter plots of highest correlated  parameters with dv
+## Salary vs Points
+ax13 <- train_norm %>% ggplot( aes(x = X3PA, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Assists
+ax14 <- train_norm %>% ggplot( aes(x = TRB, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax15 <- train_norm %>% ggplot( aes(x = BLK, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax16 <- train_norm %>% ggplot( aes(x = STL, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax17 <- train_norm %>% ggplot( aes(x = ORB, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax18 <- train_norm %>% ggplot( aes(x = PF, y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+grid.arrange(ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9, ax10, ax11, ax12, ax13, ax14, ax15, ax16, ax17, ax18,   ncol=3)
+```
+Fig.6: Scatter plot of numerical features with log-transformed salaries
+
+**Key insights:**
+1) It is visible that the outliers affect the correlation between the variables.    
+2) From the density plots, it is also known that most of the feature variables are right-skewed.      
+3) As a next step, let's first log-transform the skewed variables and see if it reduces the outliers.  
+
+```{r echo=FALSE, fig.height=15, fig.width=15, message=FALSE, warning=FALSE}
+library(gridExtra)
+
+## Scatter plots of highest correlated  parameters with dv
+
+## Salary vs Points
+ax1 <- train_norm %>% ggplot( aes(x = log(PTS), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Turn overs
+ax2 <- train_norm %>% ggplot( aes(x = log(FT), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax3 <- train_norm %>% ggplot( aes(x = log(FG), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax4 <- train_norm %>% ggplot( aes(x = log(FTA), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax5 <- train_norm %>% ggplot( aes(x = log(FGA), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax6 <- train_norm %>% ggplot( aes(x = log(Age), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Points
+ax7 <- train_norm %>% ggplot( aes(x = log(TOV), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Assists
+ax8 <- train_norm %>% ggplot( aes(x = log(AST), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax9 <- train_norm %>% ggplot( aes(x = log(X2PA), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax10 <- train_norm %>% ggplot( aes(x = log(X2P), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax11 <- train_norm %>% ggplot( aes(x = log(X3P), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax12 <- train_norm %>% ggplot( aes(x = log(DRB), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Scatter plots of highest correlated  parameters with dv
+## Salary vs Points
+ax13 <- train_norm %>% ggplot( aes(x = log(X3PA), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Assists
+ax14 <- train_norm %>% ggplot( aes(x = log(TRB), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax15 <- train_norm %>% ggplot( aes(x = log(BLK), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total
+ax16 <- train_norm %>% ggplot( aes(x = log(STL), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax17 <- train_norm %>% ggplot( aes(x = log(ORB), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+## Salary vs Field goals total attempts 
+ax18 <- train_norm %>% ggplot( aes(x = log(PF), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+
+grid.arrange(ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9, ax10, ax11, ax12, ax13, ax14, ax15, ax16, ax17, ax18,   ncol=3)
+```
+Fig.7: Scatter plots of numerical features after log-transformation vs. log-transformed salaries
+
+**Key insights:** 1) Most variables show a better correlation to the dependent variable after log-transformation.    
+2) From Fig  3, extremely high correlation between several of the features is evident.    
+  FG-PTS-FG-FGA, DRB-TRB should be examined for multi-co-linearity if used in the same model. 
+  
+
+Moving on, following variables will be checked for our initial model, taking into consideration their linear correlation with the dependent variable, possible multi-co-linearity, prior knowledge and assumptions.  
+
+
+**Variables selection for base model so far:**
+
+log(PTS), log(FT),FTA, FGA, AGE, log(TOV), log(AST), log(X2P), log(PF), Tm, Pos, Tm:FT  + Pos:PF + Pos:FT 
+
+### Removing outliers from feature FGA
+At first some of the outliers which seem to have higher effect on the correlation will be removed.    
+```{r fig.height=3, fig.width=3.5, echo=FALSE}
+FGA_1 <- train_norm[,'FGA'] %>% quantile(probs = 0.01 )
+train_norm <- train_norm[train_norm[, 'FGA']< 1-FGA_1, ]
+train_norm %>% ggplot( aes(x = log(FGA), y=log(X2020.21))) + geom_point() +
+geom_smooth()
+```
+
+
+Fig.8: Scatter plot of features after removing of outliers  
+
+## Models
+
+As mentioned before, for the initial model, the following features will be used:    
+log(PTS), log(FT),FTA, FGA, AGE, log(TOV), log(AST), log(X2P), log(PF), Tm, Pos, Tm:FT, Pos:PF, Pos:FT 
+
+In case the minimum value of a feature which needs to be transformed is 0, we added half of the smallest value that is not 0 in the feature to all values. This allows for the transformation. (e.g log(PTS+ min(PTS[PTS>0])/2))  
+
+
+### Base Model - linear regression
+
+Single term deletion with drop1 function will be used until we reach the most parsimonious model. 
+```{r}
+linear_0 <- lm(log(X2020.21) ~ 1, train_norm)
+
+linear_1 <- lm(log(X2020.21) ~ log(PTS+ min(PTS[PTS>0])/2) + log(FT+ min(FT[FT>0])/2) + 
+                 log(FTA+ min(FTA[FTA>0])/2) + log(FGA) + Age +
+                 log(TOV + min(TOV[TOV>0])/2) + log(AST+ min(AST[AST>0])/2) +
+                 log(X2P + min(X2P[X2P>0])/2)
+               + log(PF+ min(PF[PF>0])/2) + Tm + Pos + Tm:FT  + Pos:PF + Pos:FT 
+                 , train_norm)
+
+drop1(linear_1, test = "F")
+```
+```{r, results='hide'}
+linear_1_1 <- update(linear_1, .~. -log(PF + min(PF[PF > 0])/2))
+drop1(linear_1_1, test = "F")
+```
+
+```{r, results='hide'}
+linear_1_2 <- update(linear_1_1, .~. -log(X2P + min(X2P[X2P > 0])/2))
+drop1(linear_1_2, test = "F")
+```
+
+```{r, results='hide'}
+linear_1_3 <- update(linear_1_2, .~. -log(FTA + min(FTA[FTA > 0])/2))
+drop1(linear_1_3, test = "F")
+```
+
+```{r, results='hide'}
+linear_1_4 <- update(linear_1_3, .~. -log(PTS + min(PTS[PTS > 0])/2))
+drop1(linear_1_4, test = "F")
+```
+
+```{r, results='hide'}
+linear_1_5 <- update(linear_1_4, .~. -Tm:FT)
+drop1(linear_1_5, test = "F")
+```
+```{r, results='hide'}
+linear_1_6 <- update(linear_1_5, .~. -Tm)
+drop1(linear_1_6, test = "F")
+```
+```{r, results='hide'}
+linear_1_7 <- update(linear_1_6, .~. -Pos:FT)
+drop1(linear_1_7, test = "F")
+```
+```{r}
+linear_1_8 <- update(linear_1_7, .~. -log(AST + min(AST[AST > 0])/2))
+drop1(linear_1_8, test = "F")
+```
+**Key insight:** After executing drop1 function several times, all features left are statistically significant for the model. 
+
+
+
+**Examining base model for multi-co-linearity**
+
+```{r, echo=FALSE}
+library(car)
+vif(linear_1_8)
+```
+**Key insight:** Potential multi-co-linearity issue with Pos:PF and PF can be seen (highest GVIF values).  
+Feature "Pos" will be dropped from the model as well.  
+```{r, echo=FALSE}
+linear_1_9 <- update(linear_1_8, .~. -Pos)
+drop1(linear_1_9, test = "F")
+```
+Multi-co-linearity is re-examined:  
+```{r, echo=FALSE}
+library(car)
+vif(linear_1_9)
+```
+**Key insight:** The multi-co-linearity is no longer evident.  
+
+
+
+**Base Model interpretation**
+
+```{r}
+summary(linear_1_9)$coefficient
+```
+**Key insights:** 1) If a player increases his successful free throws per minute by 1%, his salary will increase by 0.469%  
+2) If a player increases his  free goal attempts per minute by 1%, his salary will increase by 0.65%  
+3) For each increase of 1 year of age, a player's salary will increase by 14%  (exp(0.1346971)=1.14419)  
+4) If a player will increase his  Turn overs per minute by 1%, his salary will increase by 0.78%  
+5) There is strong evidence that personal fouls have an effect on salary and this effect differs among the players' position.  
+
+
+
+**Base Model performance on training data** 
+
+Setting control parameters for cross validation
+```{r}
+ctrl <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+linear_1_9_cv <- train(log(X2020.21) ~ log(FT + min(FT[FT > 0])/2) + log(FGA) + Age + 
+    log(TOV + min(TOV[TOV > 0])/2) + Pos:PF,
+    train_norm, method = "lm", trControl = ctrl)
+```
+**10 folds cross-validation results **
+
+```{r, echo=FALSE}
+linear_1_9_cv$results
+```
+
+**Base Model performance on testing data**
+
+Using the model to predict salary of players in test data .
+```{r, echo=FALSE}
+predicted <- predict(linear_1_9_cv, test_norm)
+print("Model evaluation")
+print(paste0("RMSE: ", RMSE(predicted, log(test_norm$X2020.21))))
+print(paste0("R2: ", R2(predicted, log(test_norm$X2020.21))))
+```
+**Key insights:**
+RMSE of 1.59 and R2 of 0.21 do not say much without comparison to another model. Another model is needed for comparison.
+
+### General additive model (GAM)
+Setting GAM with the same initial features as the linear model, this time without the interactions. Features transformation  would be determined by the model:  
+PTS, FT,FTA, FGA, AGE, TOV, AST, X2P, PF, Tm, Pos
+```{r}
+library(mgcv)
+gam.0 <- gam(log(X2020.21) ~ s(PTS) + s(FT) + s(FGA) + s(Age) + s(TOV) + s(AST) +
+               s(X2P) + s(PF) ,
+              data = train_norm, 
+             select = TRUE) ## select=T similar to lasso selection pulling less important parameter coef to 0
+summary(gam.0)
+```
+**Key insight:** Feature FGA is not statistically significant.  
+We will remove it for further evaluation.
+
+```{r}
+gam.1 <- update(gam.0, .~. -s(FGA))
+summary(gam.1)
+```
+
+**Looking for co-linearity issues (using concurvity)**
+
+```{r, echo = FALSE}
+concurvity(gam.1)
+```
+**Key insight:** PTS feature shows high co-linearity with other features in the model.  
+We will drop it from our model.  
+```{r, results='hide'}
+gam.2 <- update(gam.1, .~. -s(PTS))
+summary(gam.2)
+```
+
+After removing PTS from our model, we observed high co-linearity of AST feature, therefore we repeated the process again.
+
+```{r}
+gam.3 <- update(gam.2, .~. -s(AST))
+summary(gam.3)
+```
+```{r, echo = FALSE}
+concurvity(gam.3)
+```
+
+**Key Insight:** No more multi-co-linearity issues.
+
+
+
+**GAM Model performance**  <br> 
+<br>
+**10 folds cross-validation**
+
+```{r, echo=TRUE, results='hide'}
+gam.3_cv <- train(log(X2020.21) ~ FT + Age + TOV + X2P + PF, family = "gaussian",
+   data = train_norm, method = "gam", trControl = ctrl)
+```
+
+```{r, echo= FALSE}
+gam.3_cv$results
+```
+
+**Model prediction and evaluation on test data**
+
+```{r}
+#Use model to predict probability of default
+predicted <- predict(gam.3_cv, test_norm)
+print("Model evaluation")
+print(paste0("RMSE: ", RMSE(predicted, log(test_norm$X2020.21))))
+print(paste0("R2: ", R2(predicted, log(test_norm$X2020.21))))
+
+```
+**Key insight:** We can see a small improvement in RMSE and R2 values relative to the base linear model.  
+
+
+\pagebreak
+
+# Classification problems
+
+In this section, we will use a predictive modelling approach.
+The model will be trained with all available features, and the results will be compared  using a confusion matrix and corresponding evaluation matrices.  
+
+Our predictive model will try to evaluate whether or not a player's salary would be higher than the median players' salaries or not in the following year.  
+
+
+## Preparing the data
+A new binary column based on median salary of players is created.
+```{r}
+train_norm$binarSalary <- ifelse(train_norm$X2020.21 > median(train_norm$X2020.21), 1,0)
+test_norm$binarSalary <- ifelse(test_norm$X2020.21 > median(test_norm$X2020.21), 1,0)
+
+```
+
+```{r, results=FALSE}
+train_norm %>% dplyr :: select(X2020.21, binarSalary) %>% head()
+```
+## Generalised linear model - Binomial
+ 
+```{r include=FALSE}
+binom_1 <- glm(binarSalary ~ . -X2020.21,
+family = "binomial",
+data = train_norm)
+```
+
+
+```{r results='hide'}
+## 10 folds cross-validation
+binom.1_cv <- train(binarSalary ~ . -X2020.21, family = "binomial",
+   data = train_norm, method = "glm", trControl = ctrl) ## 10 folds cross validation
+```
+
+**10 folds cross-validation results**
+
+```{r, echo = FALSE}
+binom.1_cv$results
+```
+
+**Model evaluation on test data- confusion Matrix**
+
+```{r}
+#Use model to predict probability of default
+predicted <- predict(binom.1_cv, test_norm)
+
+#Find optimal cutoff probability to use to maximize accuracy
+optimal <- InformationValue:: optimalCutoff(test_norm$binarSalary, predicted)[1]
+
+predicted_value <- ifelse(predicted > optimal, 1,0)
+
+#Create confusion matrix
+binom.1_cm <- caret :: confusionMatrix(factor(test_norm$binarSalary), factor(predicted_value))
+binom.1_cm$table
+```
+
+
+## GAM with familiy set to Binomial
+ 
+```{r}
+binom_2 <- gam(binarSalary ~ Tm +Pos + s(Age) + s(X3PA) + s(X3P) + s(X2PA) + s(X2P) + s(TRB) +
+                 s(TOV) + s(STL) + s(PTS) + s(PF) + s(ORB) + s(FTA) + s(FT) + s(FGA) +
+                 s(FG) + s(DRB) + s(BLK) + s(AST),
+family = "binomial",
+data = train_norm)
+```
+
+```{r include=FALSE}
+## 10 folds cross-validation
+binom.2_cv <- train(binarSalary ~ . -X2020.21, family = "binomial",
+   data = train_norm, method = "gam", trControl = ctrl) ## 10 folds cross validation
+```
+
+**10 folds cross-validation results**
+
+```{r, echo = FALSE}
+binom.2_cv$results
+```
+**Model evaluation on test data- confusion Matrix**
+
+```{r, echo=FALSE}
+#Use model to predict probability of default
+predicted <- predict(binom.2_cv, test_norm)
+
+#Find optimal cutoff probability to use to maximize accuracy
+optimal <- optimalCutoff(test_norm$binarSalary, predicted)[1]
+
+predicted_value <- ifelse(predicted > optimal, 1,0)
+
+#Create confusion matrix
+binom.2_cm <- caret :: confusionMatrix(factor(test_norm$binarSalary), factor(predicted_value))
+binom.2_cm$table
+```
+
+## Supervised vector machine model
+Cross validation on SVM model was not performed due to lack of sufficient computer power.
+
+```{r, echo=TRUE, results='hide'}
+
+svm.1 <- svm(binarSalary ~., train_norm, kernel = "linear", scale = TRUE, cost = 10)
+
+```
+
+
+**Model evaluation on test data- confusion Matrix**
+
+```{r, echo = FALSE}
+#Use model to predict probability of default
+predicted <- predict(svm.1, test_norm)
+
+#Find optimal cutoff probability to use to maximize accuracy
+optimal <- optimalCutoff(test_norm$binarSalary, predicted)[1]
+
+predicted_value <- ifelse(predicted > optimal, 1,0)
+
+#Create confusion matrix
+svm.1_cm <- caret :: confusionMatrix(factor(test_norm$binarSalary), factor(predicted_value))
+svm.1_cm$table
+
+```
+
+## Neural network model
+
+**One hot encoding for categorical data**
+```{r}
+train_norm_dummy <- data.frame(train_norm[, !colnames(train_norm) %in% c("Tm", "Pos")],
+                               model.matrix(~Tm +Pos -1, train_norm))
+test_norm_dummy <- data.frame(test_norm[, !colnames(test_norm) %in% c("Tm", "Pos")],
+                               model.matrix(~Tm +Pos -1, test_norm))
+```
+
+**Model training and optimizing with 5 folds cross validation**
+
+```{r warning=FALSE}
+tuneGrid <- expand.grid(.layer1=c(2:4), .layer2=c(0:4), .layer3=c(0))
+control <- trainControl(method="cv", number=5)
+
+NN.models <- train(train_norm_dummy %>% dplyr:: select(-c(X2020.21, binarSalary)),
+                   train_norm_dummy %>% dplyr:: pull(binarSalary),
+                   method="neuralnet",
+                   metric = 'F1',
+                   ### Parameters for optimization
+                   preProcess = c('center', 'scale'),
+                   tuneGrid = tuneGrid,
+                   trControl = control,
+                   tuneLength=5
+                   )
+```
+```{r include=FALSE}
+print(NN.models)
+```
+**Model evaluation on test data- confusion Matrix**
+
+```{r,echo=FALSE}
+#Use model to predict probability of default
+predicted <- predict(NN.models, test_norm_dummy %>% dplyr:: select(-c(X2020.21, binarSalary)))
+
+#Find optimal cutoff probability to use to maximize accuracy
+optimal <- optimalCutoff(test_norm_dummy$binarSalary, predicted)[1]
+
+predicted_value <- ifelse(predicted > optimal, 1,0)
+
+#Create confusion matrix
+NN.1_cm <- caret :: confusionMatrix(factor(test_norm_dummy$binarSalary), factor(predicted_value))
+NN.1_cm$table
+
+```
+
+## Summary classification models
+
+```{r, echo=FALSE}
+data.frame(Model=c("binom.1","binom.2", "svm.1", "NN.1"), 
+           Precision=c(binom.1_cm$byClass["Precision"], binom.2_cm$byClass["Precision"], 
+                       svm.1_cm$byClass["Precision"], NN.1_cm$byClass["Precision"]),
+           Recall=c(binom.1_cm$byClass["Recall"], binom.2_cm$byClass["Recall"], 
+                       svm.1_cm$byClass["Recall"], NN.1_cm$byClass["Recall"]),
+           F1 = c(binom.1_cm$byClass["F1"], binom.2_cm$byClass["F1"], 
+                       svm.1_cm$byClass["F1"], NN.1_cm$byClass["F1"]))
+```
+
+**Key insights:** Better performance of Support Vector Machine model in terms of precision, recall and F1 evaluation matrices.  
+The model was able to predict correctly 49 out of 60 players with salaries above the median based on their performance in the previews season (see SVM model confusion matrix). In addition the model was able to predict correctly 45 out of 51 players with salary below the median.
+
+
+# Players' performance - Predicting FG
+
+Predicting the number of FG (field goal) based on Pos, Age, Tm, X3PA, X2PA, FTA 
+
+## Preparing data
+```{r}
+train2 <- train[,c( 'Pos', 'Age', 'Tm', 'X3PA', 'X2PA', 'FTA', 'FG')]
+test2 <- test[,c( 'Pos', 'Age', 'Tm', 'X3PA', 'X2PA', 'FTA', 'FG')]
+
+```
+
+## Exploring data
+```{r, echo=FALSE, fig.cap="Histogram of FG"}
+hist(train2$FG, xlab="Field goals", main="Histogram of Field goals")
+```
+Fig.1: Histogram of FG  
+
+**Key insights:** Over dispersion of data is observed. (Long right tail distribution)
+
+## Categorical data
+
+```{r, fig.width=15, fig.height=5, echo=FALSE}
+## Boxplot Pos vs FG
+train2 %>% ggplot( aes(x = Pos, y=FG)) + geom_boxplot(na.rm = TRUE)
+
+```
+Fig.2: Boxplot of log FG  by Position
+
+```{r, fig.width=15, fig.height=5, echo=FALSE}
+## Boxplot team vs FG
+train2 %>% ggplot( aes(x = Tm, y=FG)) + geom_boxplot(na.rm = TRUE)
+
+```
+Fig.3: Boxplot of log FG  by team
+
+## GLM model 
+
+**Family set to poisson**
+```{r}
+pois_1 <- glm(FG ~ Tm +Pos + Age  + X3PA + X2PA + FTA,
+family = "poisson", ## we specify the distribution!
+data = train2)
+
+```
+```{r, include= FALSE}
+summary(pois_1)
+```
+![](glm_model_poisson.jpg)
+
+**Key insight:** The residual deviance is bigger than the degrees of freedom. This is indicative of over-dispersion of the dependent variable.
+We can also see this by the difference in mean and variance of the dependent variable.
+
+We will redo the model, this time using the quasi-poisson model.
+
+
+
+**Family set to quasi-poisson**
+
+```{r}
+qpois_1 <- glm(FG ~ Tm +Pos + Age  + X3PA + X2PA + FTA,
+family =  "quasipoisson", ## we specify the distribution!
+data = train2)
+
+```
+```{r}
+drop1(qpois_1, test = "F")
+```
+```{r, results='hide'}
+qpois_2 <- update(qpois_1, .~. -Tm)
+```
+```{r, results='hide'}
+drop1(qpois_2, test = "F")
+```
+
+```{r, results='hide'}
+qpois_3 <- update(qpois_2, .~. -Age)
+```
+```{r}
+drop1(qpois_3, test = "F")
+```
+
+```{r}
+qpois_3$coefficients
+```
+**Key insights:** 1) All predictors are statistically significant   
+2) If a player increases his 3 points attempts by 1%, his overall field goals will increase by 0.0022%   
+3) If a player increases his 2 points attempts by 1%, his overall field goals will increase by 0.0028%   
+4) If a player increases his free throws attempts by 1%, his overall field goals will decrease by -0.0009%    
+(Interesting results, one explanation could be that players who go more to the line usually have less field goals)  
+5) There is relatively strong evidence that positions have an effect on player's field goals.   
+ 
+
+**Model evaluation on test data**
+
+```{r}
+q_predict <- predict(qpois_3, test2, type="response")
+RMSE(test2$FG, q_predict)
+R2(test2$FG, q_predict)
+
+```
+
+```{r echo=FALSE}
+par(mfrow=c(2,2))
+plot(qpois_3)
+par(mfrow=c(1,1))
+
+```
+**Key insights:**
+1) From the residuals plot we can clearly see a non-linear relationship in our model  
+2) The data looks fairly normally distributed   
+
+# Optimization
+With regard to the NBA dataset, the group did not come up with an idea on optimization. Instead a fictious case from the area of marketing is presented.  
+For a marketing campaign the aim is to reach maximum of listeners at given budget. The options are through radio (A) or television (B) adverts. 'A' can reach 7,000 people at CHF 600/min, 'B' can reach 50,000 people at CHF 9,000/min. The budget for the campaign is capped at CHF 100,000.
+
+```{r}
+objective.in <- c(7000,50000) 
+const.mat <- matrix(c(600, 9000, 5,1), nrow=2,  byrow=TRUE) 
+const.rhs <- c(100000, 60) 
+const.dir <- c("<=", "<=") 
+optimum <- lp(direction="max", objective.in, const.mat, const.dir, const.rhs) 
+print(optimum$solution)
+```
+**Key insight:** By choosing 9.91 units of A and 10.45 units of B we reach most listeners while not exceeding a budget of CHF 100k.
+
+
+
+
+
